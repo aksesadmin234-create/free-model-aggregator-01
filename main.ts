@@ -62,6 +62,58 @@ const exhaustedProviders = new Set<string>();
 // Per-provider concurrency lock — one call at a time per provider
 const providerBusy = new Set<string>();
 
+/**
+ * For each future manifest entry, compute which provider IDs can serve it.
+ * Returns a set of provider IDs that should be preserved for future constrained requests.
+ * A provider is scarce if the remaining demand for a constraint exceeds the supply slack.
+ */
+function scarceProviders(currentRequires: Requirement): Set<string> {
+  const scarce = new Set<string>();
+  const manifest = brief.workload?.manifest ?? [];
+
+  // Group future requests by their constraint fingerprint
+  const constraintGroups = new Map<string, { requires: Requirement; count: number; capable: Set<string> }>();
+  for (let i = manifestIndex; i < manifest.length; i++) {
+    const futureReq = manifest[i].requires;
+    // Only care about constrained requests
+    if (!futureReq.vision && !futureReq.json && !futureReq.tools && !futureReq.min_context) continue;
+    const key = JSON.stringify(futureReq);
+    const existing = constraintGroups.get(key);
+    if (existing) { existing.count++; continue; }
+
+    // Find which non-exhausted providers can serve this
+    const capable = new Set<string>();
+    for (const probe of probes) {
+      if (!probe.ok) continue;
+      if (exhaustedProviders.has(probe.provider.id)) continue;
+      for (const model of probe.models) {
+        const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+        if (!modelFree(model, row)) continue;
+        if (!meetsRequirements(futureReq, capabilitiesOf(model, row))) continue;
+        capable.add(probe.provider.id);
+        break;
+      }
+    }
+    constraintGroups.set(key, { requires: futureReq, count: 1, capable });
+  }
+
+  // Mark providers as scarce when demand approaches supply
+  // Conservative: assume each provider can handle ~1 more successful call
+  for (const { count, capable } of constraintGroups.values()) {
+    let availableSlots = 0;
+    for (const pid of capable) {
+      const used = providerCallCount.get(pid) ?? 0;
+      availableSlots += Math.max(0, 2 - used); // optimistic 2 calls, minus already used
+    }
+    // If future demand is close to available supply, mark as scarce
+    // Use generous threshold: preserve when demand >= half the remaining slots
+    if (count * 2 >= availableSlots) {
+      for (const pid of capable) scarce.add(pid);
+    }
+  }
+  return scarce;
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -107,8 +159,19 @@ function rankedRoutes(requires: Requirement, excludeProviders?: Set<string>): Ro
       candidates.push({ probe, model, row, rating: row?.rating_milli ?? 0 });
     }
   }
+  // Compute which providers are scarce for future constrained requests
+  const scarce = scarceProviders(requires);
+
   // Primary: highest rating. Tiebreak: fewer calls used → spread budget across providers. Then id for determinism.
+  // Penalize scarce providers when this request doesn't strictly need them (i.e., there are non-scarce alternatives).
+  const hasNonScarce = candidates.some((c) => !scarce.has(c.probe.provider.id));
   candidates.sort((a, b) => {
+    // If there are non-scarce alternatives, deprioritize scarce providers
+    if (hasNonScarce) {
+      const aS = scarce.has(a.probe.provider.id) ? 1 : 0;
+      const bS = scarce.has(b.probe.provider.id) ? 1 : 0;
+      if (aS !== bS) return aS - bS; // non-scarce first
+    }
     if (b.rating !== a.rating) return b.rating - a.rating;
     const aUsed = providerCallCount.get(a.probe.provider.id) ?? 0;
     const bUsed = providerCallCount.get(b.probe.provider.id) ?? 0;

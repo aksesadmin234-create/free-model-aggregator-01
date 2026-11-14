@@ -611,7 +611,7 @@ export function openAIToGemini(body: Json, model: string): Json {
           const url = part.image_url.url as string;
           const match = url.match(/^data:([^;]+);base64,(.+)$/);
           if (match) {
-            parts.push({ inline_data: { mime_type: match[1], data: match[2] } });
+            parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
           }
         }
       }
