@@ -166,13 +166,12 @@ function rankedRoutes(requires: Requirement, excludeProviders?: Set<string>): Ro
   // Penalize scarce providers when this request doesn't strictly need them (i.e., there are non-scarce alternatives).
   const hasNonScarce = candidates.some((c) => !scarce.has(c.probe.provider.id));
   candidates.sort((a, b) => {
-    // If there are non-scarce alternatives, deprioritize scarce providers
+    if (b.rating !== a.rating) return b.rating - a.rating;
     if (hasNonScarce) {
       const aS = scarce.has(a.probe.provider.id) ? 1 : 0;
       const bS = scarce.has(b.probe.provider.id) ? 1 : 0;
-      if (aS !== bS) return aS - bS; // non-scarce first
+      if (aS !== bS) return aS - bS; // non-scarce first on tie
     }
-    if (b.rating !== a.rating) return b.rating - a.rating;
     const aUsed = providerCallCount.get(a.probe.provider.id) ?? 0;
     const bUsed = providerCallCount.get(b.probe.provider.id) ?? 0;
     if (aUsed !== bUsed) return aUsed - bUsed; // prefer less-used provider
@@ -285,13 +284,17 @@ function isRetryable(status: number): boolean {
   return status === 402 || status === 429 || status >= 500;
 }
 
-function markExhausted(providerId: string, status: number): void {
-  if (status === 402 || status === 429) exhaustedProviders.add(providerId);
+function handleFailure(providerId: string, status: number, errText: string): void {
+  // Only mark permanently exhausted if budget is spent, provider has outage, or payment required (402)
+  if (status === 402 || errText.includes('budget') || errText.includes('is out') || errText.includes('exhausted')) {
+    exhaustedProviders.add(providerId);
+    log(`${providerId} marked permanently exhausted (${status})`);
+  }
 }
 
 /** Drain a response body to avoid leaking connections. */
-async function drainBody(resp: Response): Promise<void> {
-  try { await resp.text(); } catch { /* ignore */ }
+async function drainBody(resp: Response): Promise<string> {
+  try { return await resp.text(); } catch { return ''; }
 }
 
 /**
@@ -314,7 +317,7 @@ async function callUpstream(route: Route, openAIBody: Json, isStream: boolean): 
 
   if (wire === 'openai') {
     const r = await callOpenAIWire(route, { ...openAIBody, model: route.model.id });
-    if (!r.ok) { markExhausted(pid, r.status); await drainBody(r); return { status: r.status }; }
+    if (!r.ok) { const text = await drainBody(r); handleFailure(pid, r.status, text); return { status: r.status }; }
     if (isStream && r.body) return { status: 200, stream: r.body, isRawStream: true };
     const a: unknown = await r.json();
     return { status: 200, openAIBody: isRecord(a) ? a : {} };
@@ -324,7 +327,7 @@ async function callUpstream(route: Route, openAIBody: Json, isStream: boolean): 
     const ab = openAIToAnthropicUpstream(openAIBody, route.model.id);
     if (isStream) ab.stream = true;
     const r = await callAnthropicWire(route, ab);
-    if (!r.ok) { markExhausted(pid, r.status); await drainBody(r); return { status: r.status }; }
+    if (!r.ok) { const text = await drainBody(r); handleFailure(pid, r.status, text); return { status: r.status }; }
     if (isStream && r.body) return { status: 200, stream: openAIEventsFromAnthropic(r.body, route.model.id), isRawStream: false };
     const a: unknown = await r.json();
     return { status: 200, openAIBody: isRecord(a) ? anthropicUpstreamToOpenAI(a) : {} };
@@ -333,7 +336,7 @@ async function callUpstream(route: Route, openAIBody: Json, isStream: boolean): 
   if (wire === 'gemini') {
     const gb = openAIToGemini(openAIBody, route.model.id);
     const r = await callGeminiWire(route, gb, isStream);
-    if (!r.ok) { markExhausted(pid, r.status); await drainBody(r); return { status: r.status }; }
+    if (!r.ok) { const text = await drainBody(r); handleFailure(pid, r.status, text); return { status: r.status }; }
     if (isStream && r.body) return { status: 200, stream: openAIEventsFromGemini(r.body, route.model.id), isRawStream: false };
     const a: unknown = await r.json();
     return { status: 200, openAIBody: isRecord(a) ? geminiToOpenAI(a, route.model.id) : {} };
